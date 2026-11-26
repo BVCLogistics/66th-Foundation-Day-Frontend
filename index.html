@@ -87,7 +87,7 @@ dialog::backdrop { background: #080f6bad; }
 .fields { display: grid; gap: .95rem; }
 label { display: block; font-weight: 700; }
 .field { display: grid; gap: .3rem; }
-.fields input:not([type=file]), textarea { width: 100%; border: 1px solid #8994bc; border-radius: .42rem; padding: .55rem .7rem; color: var(--ink); background: #fff; }
+.fields input:not([type=file]), #email-sign-in input, textarea { width: 100%; border: 1px solid #8994bc; border-radius: .42rem; padding: .55rem .7rem; color: var(--ink); background: #fff; }
 textarea { resize: vertical; min-height: 7.5rem; }
 .drop { padding: .85rem; border: 1px dashed #788bae; border-radius: .55rem; background: var(--paper); min-width: 0; }
 .drop[data-active="true"] { background: var(--tint); outline: 2px solid var(--accent); }
@@ -176,11 +176,25 @@ input[type=file]:disabled::file-selector-button { cursor: default; color: #62677
     </div>
   </section>
 </main>
-<footer><div class="wrap"><p>BVC Logistics · Internal activities</p><p>Front-end preview</p></div></footer>
+<footer><div class="wrap"><p>BVC Logistics · Internal activities</p><button class="card-action" id="sign-out" type="button" hidden>Sign out</button></div></footer>
 <dialog id="entry-dialog" aria-labelledby="entry-title">
   <div class="dialog-head">
     <h2 id="entry-title" tabindex="-1" autofocus></h2>
     <button class="close" type="button" data-close aria-label="Close entry form">×</button>
+  </div>
+  <div id="email-sign-in" hidden>
+    <form id="email-request-form" method="dialog">
+      <p>Verify your <strong>@bvclogistics.com</strong> email to enter. We’ll send you a six-digit code.</p>
+      <div class="field"><label for="work-email">Work email</label><input type="email" id="work-email" autocomplete="email" maxlength="254" required></div>
+      <div class="actions"><button class="btn" type="submit">Send sign-in code</button></div>
+    </form>
+    <form id="email-code-form" method="dialog" hidden>
+      <p>If your work email is on the approved list, you’ll receive a six-digit code. Check your junk folder if it hasn’t arrived.</p>
+      <div class="field"><label for="work-code">Sign-in code</label><input id="work-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required></div>
+      <div class="actions"><button class="btn outline" type="button" id="switch-email">Use another email or request a new code</button><button class="btn" type="submit">Verify email</button></div>
+    </form>
+    <p id="signin-status" role="status" class="hint" hidden></p>
+    <p id="signin-error" role="alert" class="error" hidden></p>
   </div>
   <form id="entry-form" method="dialog">
     <p class="instructions" id="entry-instructions"></p>
@@ -192,7 +206,7 @@ input[type=file]:disabled::file-selector-button { cursor: default; color: #62677
       <strong id="journal-sample-title">Sample journal entry</strong>
       <blockquote>“I’m thankful for my team at BVC. When I joined, my teammates showed me how to pack orders and answered my questions. Their help made me feel welcome.”</blockquote>
     </section>
-    <p class="dialog-note">Preview only. Use sample details and files. This page does not send entries.</p>
+    <p class="dialog-note">All fields are required. Your entry will be shared with the BVC review team.</p>
     <div class="fields">
       <div class="field"><label for="employee">Employee name</label><input id="employee" name="employee" required></div>
       <div class="field"><label for="employee-code">Employee code</label><input id="employee-code" name="employee-code" required></div>
@@ -214,7 +228,8 @@ input[type=file]:disabled::file-selector-button { cursor: default; color: #62677
       </div>
       <div class="field" id="journal-field" hidden><label for="journal">What are you grateful for about BVC?</label><textarea id="journal" name="journal" rows="5"></textarea></div>
     </div>
-    <div class="actions"><button class="btn outline" type="button" data-close>Cancel</button><button class="btn" type="submit">Test entry form</button></div>
+    <p class="error" id="entry-submit-error" role="alert" hidden></p>
+    <div class="actions"><button class="btn outline" type="button" data-close>Cancel</button><button class="btn" type="submit">Submit entry</button></div>
   </form>
   <div id="confirmation" hidden>
     <p id="confirmation-text" role="status"></p>
@@ -278,6 +293,21 @@ const activityTitles = Object.fromEntries(activityButtons.map(button => [
 let activity;
 let trigger;
 let selected = [];
+let accessToken = null;
+let challenge = null;
+let submissionId = null;
+let sending = false;
+const entryError = document.querySelector('#entry-submit-error');
+const entryFields = form.querySelector('.fields');
+const emailSignIn = document.querySelector('#email-sign-in');
+const requestForm = document.querySelector('#email-request-form');
+const codeForm = document.querySelector('#email-code-form');
+const workEmail = document.querySelector('#work-email');
+const workCode = document.querySelector('#work-code');
+const signinStatus = document.querySelector('#signin-status');
+const signinError = document.querySelector('#signin-error');
+const signOut = document.querySelector('#sign-out');
+const backend = 'https://bvc-logistics-reviewer.workspace-252868.chatgpt.site/api/employee/';
 const imageFormats = 'image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,image/avif,.heic,.heif';
 const videoFormats = 'video/mp4,video/quicktime,video/webm,.mov';
 childPhoto.accept = imageFormats;
@@ -362,6 +392,9 @@ activityButtons.forEach(button => {
     updateUploadAccess();
     confirmation.hidden = true;
     form.hidden = false;
+    submissionId = crypto.randomUUID();
+    entryError.hidden = true;
+    updateEntryAccess();
     dialog.showModal();
     dialog.scrollTop = 0;
     entryTitle.focus({ preventScroll: true });
@@ -399,8 +432,85 @@ mediaField.addEventListener('drop', event => {
   selectFiles(event.dataTransfer.files);
 });
 
-form.addEventListener('submit', event => {
+function updateEntryAccess() {
+  form.hidden = !accessToken;
+  emailSignIn.hidden = Boolean(accessToken);
+  signOut.hidden = !accessToken;
+  if (!accessToken) {
+    requestForm.hidden = false;
+    codeForm.hidden = true;
+    signinError.hidden = true;
+    signinStatus.hidden = true;
+    workCode.value = '';
+  }
+}
+
+async function callApi(path, body, extraHeaders = {}) {
+  const response = await fetch(backend + path, { method: 'POST', body, headers: extraHeaders, credentials: 'omit' });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(result.error || 'The submission service could not complete the request.');
+    error.status = response.status;
+    throw error;
+  }
+  return result;
+}
+
+async function authRequest(event, path, data, onSuccess) {
   event.preventDefault();
+  if (sending) return;
+  const submit = event.currentTarget.querySelector('[type=submit]');
+  sending = true;
+  submit.disabled = true;
+  signinError.hidden = true;
+  signinStatus.hidden = false;
+  signinStatus.textContent = path === 'send-code' ? 'Sending your code…' : 'Verifying your code…';
+  try {
+    const result = await callApi(path, JSON.stringify(data), { 'Content-Type': 'application/json' });
+    onSuccess(result);
+  } catch (error) {
+    signinError.textContent = error instanceof TypeError ? 'Email sign-in is temporarily unavailable. Try again shortly.' : error.message;
+    signinError.hidden = false;
+  } finally {
+    sending = false;
+    signinStatus.hidden = true;
+    submit.disabled = false;
+  }
+}
+
+requestForm.addEventListener('submit', event => {
+  authRequest(event, 'send-code', { email: workEmail.value.trim() }, result => {
+    if (!result.challenge) throw Error('The code could not be sent. Please try again.');
+    challenge = result.challenge;
+    requestForm.hidden = true;
+    codeForm.hidden = false;
+    workCode.focus();
+  });
+});
+codeForm.addEventListener('submit', event => {
+  authRequest(event, 'verify-code', { challenge, code: workCode.value.trim() }, result => {
+    if (!result.token) throw Error('The email could not be verified. Please try again.');
+    accessToken = result.token;
+    challenge = null;
+    updateEntryAccess();
+    form.querySelector('#employee').focus();
+  });
+});
+document.querySelector('#switch-email').addEventListener('click', () => {
+  if (sending) return;
+  updateEntryAccess();
+  workEmail.focus();
+});
+signOut.addEventListener('click', () => {
+  accessToken = null;
+  challenge = null;
+  workEmail.value = '';
+  updateEntryAccess();
+});
+
+form.addEventListener('submit', async event => {
+  event.preventDefault();
+  if (sending || !accessToken) return;
   if (activity.label && !selected.length) {
     if (error.hidden) showError('Choose a file to continue.');
     media.focus();
@@ -412,15 +522,51 @@ form.addEventListener('submit', event => {
     media.focus();
     return;
   }
-  entryTitle.textContent = 'Preview complete';
-  confirmationText.textContent = 'Your sample entry passed the form checks. This preview does not send or store your entry.';
-  form.reset();
-  showFiles([]);
-  form.hidden = true;
-  confirmation.hidden = false;
-  confirmation.querySelector('button').focus();
+  const payload = new FormData(form);
+  payload.set('activity', trigger.dataset.activity);
+  selected.forEach(file => payload.append('entry-file', file));
+  const submit = form.querySelector('[type=submit]');
+  entryError.hidden = true;
+  sending = true;
+  submit.disabled = true;
+  entryFields.inert = true;
+  submit.textContent = 'Submitting…';
+  try {
+    const result = await callApi('submissions', payload, {
+      Authorization: 'Bearer ' + accessToken, 'Idempotency-Key': submissionId
+    });
+    if (!result.id) throw Error('We couldn’t confirm your entry. Please try again.');
+    entryTitle.textContent = 'Entry submitted';
+    confirmationText.textContent = 'Your receipt number is ' + result.id + '.';
+    form.reset();
+    showFiles([]);
+    form.hidden = true;
+    confirmation.hidden = false;
+    confirmation.querySelector('button').focus();
+  } catch (failure) {
+    if (failure.status === 401) {
+      accessToken = null;
+      updateEntryAccess();
+      signinError.textContent = 'Your session has expired. Verify your email again to finish submitting.';
+      signinError.hidden = false;
+      workEmail.focus();
+    } else {
+      entryError.textContent = failure instanceof TypeError
+        ? 'We couldn’t confirm your entry. Try again without closing this form.'
+        : failure.message;
+      entryError.hidden = false;
+    }
+  } finally {
+    sending = false;
+    submit.disabled = false;
+    entryFields.inert = false;
+    submit.textContent = 'Submit entry';
+  }
 });
-dialog.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => dialog.close()));
+dialog.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => {
+  if (!sending) dialog.close();
+}));
+dialog.addEventListener('cancel', event => { if (sending) event.preventDefault(); });
 dialog.addEventListener('close', () => {
   form.reset();
   showFiles([]);
